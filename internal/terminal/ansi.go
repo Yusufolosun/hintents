@@ -6,7 +6,6 @@ package terminal
 import (
 	"fmt"
 	"os"
-	"sync"
 
 	"github.com/mattn/go-isatty"
 )
@@ -24,20 +23,14 @@ const (
 	sgrBold    = "\033[1m"
 )
 
-type ANSIRenderer struct {
-	isTTY   bool
-	ttyOnce sync.Once
-}
+type ANSIRenderer struct{}
 
 func NewANSIRenderer() *ANSIRenderer {
 	return &ANSIRenderer{}
 }
 
 func (r *ANSIRenderer) IsTTY() bool {
-	r.ttyOnce.Do(func() {
-		r.isTTY = r.checkTTY()
-	})
-	return r.isTTY
+	return r.checkTTY()
 }
 
 func (r *ANSIRenderer) checkTTY() bool {

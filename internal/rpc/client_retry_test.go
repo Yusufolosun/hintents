@@ -74,6 +74,10 @@ func TestGetLedgerEntriesRetriesOnRateLimit(t *testing.T) {
 	var calls int32
 	key := createTestLedgerKey(t, 42)
 
+	// validKey is a base64-encoded XDR LedgerKey (account type) that passes
+	// the cryptographic verification step in getLedgerEntriesAttempt.
+	const validKey = "AAAAAAAAAABqbUHHOUNTgIZpeXjQQHgNYcXOazSxcCrhBCh2M4Od7g=="
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&calls, 1) == 1 {
 			w.Header().Set("Retry-After", "1")
@@ -85,6 +89,7 @@ func TestGetLedgerEntriesRetriesOnRateLimit(t *testing.T) {
 			Jsonrpc: "2.0",
 			ID:      1,
 		}
+
 		resp.Result.Entries = []LedgerEntryResult{{
 			Key: key,
 			Xdr: "BBB",
@@ -99,6 +104,7 @@ func TestGetLedgerEntriesRetriesOnRateLimit(t *testing.T) {
 		WithSorobanURL(server.URL),
 		WithCacheEnabled(false),
 		WithHTTPClient(newRetryHTTPClient()),
+		WithCacheEnabled(false),
 	)
 	if err != nil {
 		t.Fatalf("failed to build client: %v", err)

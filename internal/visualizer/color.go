@@ -9,19 +9,6 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-// ANSI SGR codes used for colorized output.
-const (
-	sgrReset   = "\033[0m"
-	sgrRed     = "\033[31m"
-	sgrGreen   = "\033[32m"
-	sgrYellow  = "\033[33m"
-	sgrBlue    = "\033[34m"
-	sgrMagenta = "\033[35m"
-	sgrCyan    = "\033[36m"
-	sgrDim     = "\033[2m"
-	sgrBold    = "\033[1m"
-)
-
 // ColorEnabled reports whether ANSI color output should be used.
 // Checks NO_COLOR and TERM=dumb environment variables on every call
 // so that tests can control color via env vars dynamically.
