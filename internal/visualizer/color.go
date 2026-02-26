@@ -166,7 +166,6 @@ func Symbol(name string) string {
 		}
 	}
 
-
 	switch name {
 	case "check":
 		return "[OK]"
