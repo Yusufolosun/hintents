@@ -4,15 +4,16 @@
 package simulator
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"runtime"
+	"strconv"
 
+	"github.com/dotandev/hintents/internal/errors"
+	"github.com/dotandev/hintents/internal/ipc"
 	"github.com/dotandev/hintents/internal/logger"
 )
 
@@ -20,6 +21,8 @@ import (
 type Runner struct {
 	BinaryPath string
 	Debug      bool
+	MockTime   int64 // non-zero overrides Timestamp in every SimulationRequest
+	Validator  *Validator
 }
 
 // Compile-time check to ensure Runner implements RunnerInterface
@@ -49,7 +52,19 @@ func NewRunner(simPathOverride string, debug bool) (*Runner, error) {
 	return &Runner{
 		BinaryPath: path,
 		Debug:      debug,
+		Validator:  NewValidator(false),
 	}, nil
+}
+
+// NewRunnerWithMockTime creates a Runner that overrides the ledger timestamp on
+// every request with the provided Unix epoch value. Pass 0 to disable the override.
+func NewRunnerWithMockTime(simPathOverride string, debug bool, mockTime int64) (*Runner, error) {
+	r, err := NewRunner(simPathOverride, debug)
+	if err != nil {
+		return nil, err
+	}
+	r.MockTime = mockTime
+	return r, nil
 }
 
 // -------------------- Binary Discovery --------------------
@@ -60,7 +75,7 @@ func findSimBinary(simPathOverride string) (string, string, error) {
 		if isExecutable(simPathOverride) {
 			return abs(simPathOverride), "flag --sim-path", nil
 		}
-		return "", "", fmt.Errorf("sim-path provided but not executable: %s", simPathOverride)
+		return "", "", errors.WrapSimulatorNotFound(simPathOverride)
 	}
 
 	// 2. Environment variable
@@ -102,9 +117,7 @@ func findSimBinary(simPathOverride string) (string, string, error) {
 		return p, "global PATH", nil
 	}
 
-	return "", "", fmt.Errorf(
-		"erst-sim binary not found (use --sim-path or set ERST_SIM_PATH)",
-	)
+	return "", "", errors.WrapSimulatorNotFound("erst-sim binary not found (use --sim-path or set ERST_SIM_PATH)")
 }
 
 func isExecutable(path string) bool {
@@ -112,7 +125,13 @@ func isExecutable(path string) bool {
 	if err != nil {
 		return false
 	}
-	return !info.IsDir() && info.Mode()&0111 != 0
+	if info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true // On Windows, if it's a file and we can stat it, assume it's executable for now
+	}
+	return info.Mode()&0111 != 0
 }
 
 func abs(path string) string {
@@ -122,9 +141,77 @@ func abs(path string) string {
 	return path
 }
 
+// getSandboxNativeTokenCap returns the effective sandbox native token cap (stroops):
+// request field if set, otherwise env ERST_SANDBOX_NATIVE_TOKEN_CAP_STROOPS.
+func getSandboxNativeTokenCap(req *SimulationRequest) *uint64 {
+	if req != nil && req.SandboxNativeTokenCapStroops != nil {
+		return req.SandboxNativeTokenCapStroops
+	}
+	if v := os.Getenv("ERST_SANDBOX_NATIVE_TOKEN_CAP_STROOPS"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return &n
+		}
+	}
+	return nil
+}
+
+// getSimulatorMemoryLimit returns the effective simulator memory ceiling in bytes:
+// request field if set, otherwise env ERST_SIM_MEMORY_LIMIT_BYTES.
+func getSimulatorMemoryLimit(req *SimulationRequest) *uint64 {
+	if req != nil && req.MemoryLimit != nil {
+		return req.MemoryLimit
+	}
+	if v := os.Getenv("ERST_SIM_MEMORY_LIMIT_BYTES"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return &n
+		}
+	}
+	return nil
+}
+
+func getSimulatorCoverageLCOVPath(req *SimulationRequest) *string {
+	if req != nil && req.CoverageLCOVPath != nil {
+		return req.CoverageLCOVPath
+	}
+	if v := os.Getenv("ERST_SIM_COVERAGE_LCOV_PATH"); v != "" {
+		return &v
+	}
+	return nil
+}
+
 // -------------------- Execution --------------------
 
 func (r *Runner) Run(req *SimulationRequest) (*SimulationResponse, error) {
+	if req == nil {
+		return nil, errors.NewSimErrorMsg(errors.CodeValidationFailed, "simulation request cannot be nil")
+	}
+
+	if req.MemoryLimit == nil {
+		req.MemoryLimit = getSimulatorMemoryLimit(req)
+	}
+	if req.CoverageLCOVPath == nil {
+		req.CoverageLCOVPath = getSimulatorCoverageLCOVPath(req)
+	}
+	if req.CoverageLCOVPath != nil {
+		req.EnableCoverage = true
+	}
+
+	// Enforce sandbox native token cap when set (local/sandbox economic constraint)
+	if capStroops := getSandboxNativeTokenCap(req); capStroops != nil {
+		if err := EnforceSandboxNativeTokenCap(req.EnvelopeXdr, *capStroops); err != nil {
+			logger.Logger.Error("Sandbox native token cap exceeded", "error", err)
+			return nil, err
+		}
+	}
+
+	// Validate request before processing
+	if r.Validator != nil {
+		if err := r.Validator.ValidateRequest(req); err != nil {
+			logger.Logger.Error("Request validation failed", "error", err)
+			return nil, err
+		}
+	}
+
 	proto := GetOrDefault(req.ProtocolVersion)
 
 	if req.ProtocolVersion != nil {
@@ -137,66 +224,46 @@ func (r *Runner) Run(req *SimulationRequest) (*SimulationResponse, error) {
 		return nil, err
 	}
 
+	if r.MockTime != 0 {
+		req.Timestamp = r.MockTime
+	}
+
 	inputBytes, err := json.Marshal(req)
 	if err != nil {
 		logger.Logger.Error("Failed to marshal simulation request", "error", err)
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, errors.WrapMarshalFailed(err)
 	}
 
 	cmd := exec.Command(r.BinaryPath)
 	cmd.Stdin = bytes.NewReader(inputBytes)
 
-	// Set environment variables for Rust logger
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("RUST_LOG=%s", logger.GetRustLogLevel()),
-		fmt.Sprintf("ERST_LOG_FORMAT=%s", logger.GetRustLogFormat()),
-	)
-
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	// Create a pipe to capture and forward Rust stderr to Go logger
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		logger.Logger.Error("Failed to create stderr pipe", "error", err)
-		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	// Start the command
-	if err := cmd.Start(); err != nil {
-		logger.Logger.Error("Failed to start simulator", "error", err)
-		return nil, fmt.Errorf("failed to start simulator: %w", err)
-	}
-
-	// Read and log stderr from Rust in real-time
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				// Forward Rust logs to Go logger with [rust] prefix
-				logger.Logger.Info("[rust] "+line, "source", "simulator")
-			}
-		}
-	}()
-
-	// Wait for command to complete
-	if err := cmd.Wait(); err != nil {
-		logger.Logger.Error("Simulator execution failed", "error", err)
-		return nil, fmt.Errorf("simulator execution failed: %w", err)
+	if err := cmd.Run(); err != nil {
+		logger.Logger.Error("Simulator execution failed", "error", err, "stderr", stderr.String())
+		return nil, errors.WrapSimCrash(err, stderr.String())
 	}
 
 	var resp SimulationResponse
 	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
 		logger.Logger.Error("Failed to unmarshal response", "error", err)
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		return nil, errors.WrapUnmarshalFailed(err, stdout.String())
+	}
+
+	// If the simulator returned a logical error inside the response payload,
+	// classify it into a unified ErstError before returning to the caller.
+	if resp.Error != "" {
+		classified := (&ipc.Error{Code: resp.ErrorCode, Message: resp.Error}).ToErstError()
+		logger.Logger.Error("Simulator returned error",
+			"code", classified.Code,
+			"original", classified.OriginalError,
+		)
+		return nil, classified
 	}
 
 	resp.ProtocolVersion = &proto.Version
-
-	if resp.Status == "error" {
-		return nil, fmt.Errorf("simulation error: %s", resp.Error)
-	}
 
 	return &resp, nil
 }
@@ -220,6 +287,10 @@ func (r *Runner) applyProtocolConfig(req *SimulationRequest, proto *Protocol) er
 
 	if opcodes, ok := proto.Features["supported_opcodes"].([]string); ok {
 		req.CustomAuthCfg["supported_opcodes"] = opcodes
+	}
+
+	if calib, ok := proto.Features["resource_calibration"].(*ResourceCalibration); ok {
+		req.ResourceCalibration = calib
 	}
 
 	return nil
