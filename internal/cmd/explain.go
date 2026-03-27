@@ -1,4 +1,4 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package cmd
@@ -91,7 +91,7 @@ func explainFromNetwork(cmd *cobra.Command, txHash string) error {
 		token = os.Getenv("ERST_RPC_TOKEN")
 	}
 	if token == "" {
-		if cfg, err := config.LoadConfig(); err == nil && cfg.RPCToken != "" {
+		if cfg, err := config.Load(); err == nil && cfg.RPCToken != "" {
 			token = cfg.RPCToken
 		}
 	}
@@ -132,7 +132,7 @@ func explainFromNetwork(cmd *cobra.Command, txHash string) error {
 		return fmt.Errorf("failed to initialize simulator: %w", err)
 	}
 
-	simResp, err := runner.Run(&simulator.SimulationRequest{
+	simResp, err := runner.Run(cmd.Context(), &simulator.SimulationRequest{
 		EnvelopeXdr:   resp.EnvelopeXdr,
 		ResultMetaXdr: resp.ResultMetaXdr,
 		LedgerEntries: ledgerEntries,
@@ -159,5 +159,8 @@ func init() {
 	explainCmd.Flags().StringVarP(&explainNetworkFlag, "network", "n", "mainnet", "Stellar network (testnet, mainnet, futurenet)")
 	explainCmd.Flags().StringVar(&explainRPCURLFlag, "rpc-url", "", "Custom RPC URL")
 	explainCmd.Flags().StringVar(&explainRPCToken, "rpc-token", "", "RPC authentication token (can also use ERST_RPC_TOKEN env var)")
+
+	_ = explainCmd.RegisterFlagCompletionFunc("network", completeNetworkFlag)
+
 	rootCmd.AddCommand(explainCmd)
 }

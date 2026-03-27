@@ -1,10 +1,11 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package cmd
 
 import (
-        "os"
+	"os"
+
 	"github.com/spf13/cobra"
 )
 
@@ -57,7 +58,7 @@ PowerShell:
 	Run: func(cmd *cobra.Command, args []string) {
 		switch args[0] {
 		case "bash":
-			cmd.Root().GenBashCompletion(os.Stdout)
+			cmd.Root().GenBashCompletionV2(os.Stdout, true)
 		case "zsh":
 			cmd.Root().GenZshCompletion(os.Stdout)
 		case "fish":

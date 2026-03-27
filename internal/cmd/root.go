@@ -1,19 +1,31 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package cmd
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"sync/atomic"
+	"syscall"
+
+	"github.com/dotandev/hintents/internal/deeplink"
 	"github.com/dotandev/hintents/internal/localization"
+	"github.com/dotandev/hintents/internal/shutdown"
 	"github.com/dotandev/hintents/internal/updater"
 	"github.com/spf13/cobra"
 )
 
 // Global flag variables
 var (
-	TimestampFlag int64
-	WindowFlag    int64
-	ProfileFlag   bool
+	TimestampFlag     int64
+	WindowFlag        int64
+	ProfileFlag       bool
+	ProfileFormatFlag string
+	DeepLinkFlag      string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -40,6 +52,12 @@ Examples:
 
 Get started with 'erst debug --help' or visit the documentation.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Handle deep link probe invocation before anything else.
+		// The doctor command triggers this to verify OS dispatch works.
+		if DeepLinkFlag != "" {
+			return handleDeepLinkProbe(DeepLinkFlag)
+		}
+
 		// Load localizations
 		if err := localization.LoadTranslations(); err != nil {
 			return err
@@ -54,12 +72,76 @@ Get started with 'erst debug --help' or visit the documentation.`,
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	Version:       Version,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() error {
-	return rootCmd.Execute()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	coordinator := shutdown.NewCoordinator()
+	setShutdownCoordinator(coordinator)
+	defer clearShutdownCoordinator()
+
+	return executeWithSignals(ctx, stop, sigCh, coordinator, func(execCtx context.Context) error {
+		return rootCmd.ExecuteContext(execCtx)
+	})
+}
+
+var forceExit = os.Exit
+
+func executeWithSignals(
+	ctx context.Context,
+	stop context.CancelFunc,
+	sigCh <-chan os.Signal,
+	coordinator *shutdown.Coordinator,
+	execFn func(context.Context) error,
+) error {
+	var interrupted atomic.Bool
+	shutdownDone := make(chan struct{})
+
+	go func() {
+		defer close(shutdownDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				if interrupted.CompareAndSwap(false, true) {
+					stop()
+					shutdownComplete := make(chan struct{})
+					go func() {
+						runShutdownHooksWithTimeout(coordinator, shutdownTimeout)
+						close(shutdownComplete)
+					}()
+					select {
+					case <-shutdownComplete:
+					case <-sigCh:
+						forceExit(InterruptExitCode)
+					}
+					return
+				}
+				forceExit(InterruptExitCode)
+			}
+		}
+	}()
+
+	err := execFn(ctx)
+	stop()
+	<-shutdownDone
+
+	if interrupted.Load() {
+		_ = err
+		return ErrInterrupted
+	}
+
+	return err
 }
 
 // checkForUpdatesAsync runs the update check in a goroutine to not block CLI startup
@@ -70,6 +152,27 @@ func checkForUpdatesAsync() {
 		checker := updater.NewChecker(Version)
 		checker.CheckForUpdates()
 	}()
+}
+
+// handleDeepLinkProbe processes an erst:// URL dispatched by the OS or by the
+// doctor probe.  For the well-known probe URL it exits 0 immediately so the
+// doctor check can confirm the binary is reachable.
+func handleDeepLinkProbe(rawURL string) error {
+	if !strings.HasPrefix(rawURL, deeplink.Scheme+"://") {
+		return fmt.Errorf("unrecognised deep link scheme: %s", rawURL)
+	}
+
+	path := strings.TrimPrefix(rawURL, deeplink.Scheme+"://")
+
+	switch path {
+	case "doctor-probe":
+		// Intentional no-op: the doctor check just needs exit code 0.
+		os.Exit(0)
+	default:
+		return fmt.Errorf("unhandled deep link path: %s", path)
+	}
+
+	return nil
 }
 
 func init() {
@@ -92,8 +195,24 @@ func init() {
 		&ProfileFlag,
 		"profile",
 		false,
-		"Enable CPU/Memory profiling and generate a flamegraph SVG",
+		"Enable CPU/Memory profiling and generate a flamegraph",
 	)
+
+	rootCmd.PersistentFlags().StringVar(
+		&ProfileFormatFlag,
+		"profile-format",
+		"html",
+		"Flamegraph export format: 'html' (interactive) or 'svg' (raw)",
+	)
+
+	rootCmd.PersistentFlags().StringVar(
+		&DeepLinkFlag,
+		"deep-link",
+		"",
+		"Handle an erst:// deep link URL (used internally by the doctor probe)",
+	)
+	// Hide from normal help output; it is an internal dispatch mechanism.
+	_ = rootCmd.PersistentFlags().MarkHidden("deep-link")
 
 	// Define command groups for better organization
 	rootCmd.AddGroup(&cobra.Group{

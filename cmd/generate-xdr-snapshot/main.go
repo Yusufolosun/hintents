@@ -1,4 +1,4 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package main
@@ -194,7 +194,7 @@ func main() {
 	fmt.Printf("Total entries generated: %d\n", config.Count)
 	fmt.Printf("Total file size: %.2f MB (%.0f bytes)\n", fileSizeMB, float64(fileSizeBytes))
 	fmt.Printf("Average XDR value size: %.0f bytes\n", avgEntrySize)
-	fmt.Printf("Estimated overhead (keys + JSON): %.2f %%\n", 
+	fmt.Printf("Estimated overhead (keys + JSON): %.2f %%\n",
 		(float64(fileSizeBytes)/float64(config.Count*1000))*100)
 	fmt.Printf("\nSnapshot saved successfully!\n")
 }

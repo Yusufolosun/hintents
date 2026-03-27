@@ -1,13 +1,15 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dotandev/hintents/internal/config"
+	"github.com/dotandev/hintents/internal/decenstorage"
 	"github.com/dotandev/hintents/internal/decoder"
 	"github.com/dotandev/hintents/internal/errors"
 	"github.com/dotandev/hintents/internal/logger"
@@ -37,25 +40,38 @@ import (
 )
 
 var (
-	networkFlag        string
-	rpcURLFlag         string
-	rpcTokenFlag       string
-	tracingEnabled     bool
-	otlpExporterURL    string
-	generateTrace      bool
-	traceOutputFile    string
-	snapshotFlag       string
-	compareNetworkFlag string
-	verbose            bool
-	wasmPath           string
-	wasmOptimizeFlag   bool
-	args               []string
-	noCacheFlag        bool
-	demoMode           bool
-	watchFlag          bool
-	watchTimeoutFlag   int
-	mockBaseFeeFlag    uint32
-	mockGasPriceFlag   uint64
+	networkFlag         string
+	rpcURLFlag          string
+	rpcTokenFlag        string
+	tracingEnabled      bool
+	otlpExporterURL     string
+	generateTrace       bool
+	traceOutputFile     string
+	snapshotFlag        string
+	compareNetworkFlag  string
+	verbose             bool
+	wasmPath            string
+	wasmOptimizeFlag    bool
+	args                []string
+	themeFlag           string
+	noCacheFlag         bool
+	demoMode            bool
+	watchFlag           bool
+	watchTimeoutFlag    int
+	hotReloadFlag       bool
+	hotReloadInterval   time.Duration
+	protocolVersionFlag uint32
+	auditKeyFlag        string
+	publishIPFSFlag     bool
+	publishArweaveFlag  bool
+	ipfsNodeFlag        string
+	arweaveGatewayFlag  string
+	arweaveWalletFlag   string
+	mockTimeFlag        int64
+	mockBaseFeeFlag     uint32
+	mockGasPriceFlag    uint64
+	asyncFlag           bool
+	asyncTimeoutFlag    int
 )
 
 // DebugCommand holds dependencies for the debug command
@@ -107,7 +123,7 @@ func (d *DebugCommand) runDebug(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("ERST_RPC_TOKEN")
 	}
 	if token == "" {
-		cfg, err := config.LoadConfig()
+		cfg, err := config.Load()
 		if err == nil && cfg.RPCToken != "" {
 			token = cfg.RPCToken
 		}
@@ -151,9 +167,8 @@ func (d *DebugCommand) runDebug(cmd *cobra.Command, args []string) error {
 }
 
 var debugCmd = &cobra.Command{
-	Use:     "debug <transaction-hash>",
-	GroupID: "core",
-	Short:   "Debug a failed Soroban transaction",
+	Use:   "debug <transaction-hash>",
+	Short: "Debug a failed Soroban transaction",
 	Long: `Fetch and simulate a Soroban transaction to debug failures and analyze execution.
 
 This command retrieves the transaction envelope from the Stellar network, runs it
@@ -189,6 +204,10 @@ Local WASM Replay Mode:
   erst debug --demo`,
 	Args: cobra.MaximumNArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if hotReloadFlag && wasmPath == "" {
+			return errors.WrapValidationError("--hot-reload requires --wasm")
+		}
+
 		// Demo mode or local WASM replay don't need transaction hash
 		if demoMode || wasmPath != "" {
 			return nil
@@ -261,6 +280,16 @@ Local WASM Replay Mode:
 		// Network transaction replay mode
 		ctx := cmd.Context()
 		txHash := cmdArgs[0]
+
+		// Load persisted viewer state for this transaction (best-effort).
+		var uiStore *session.UIStateStore
+		if s, err := session.NewUIStateStore(); err == nil {
+			uiStore = s
+			defer uiStore.Close()
+			if prev, err := uiStore.LoadSectionState(ctx, txHash); err == nil && len(prev) > 0 {
+				fmt.Printf("Restoring viewer state: last session showed [%s] for this transaction.\n", strings.Join(prev, ", "))
+			}
+		}
 
 		// Initialize OpenTelemetry if enabled
 		if tracingEnabled {
@@ -455,7 +484,7 @@ Local WASM Replay Mode:
 				}
 				applySimulationFeeMocks(simReq)
 
-				simResp, err = runner.Run(simReq)
+				simResp, err = runner.Run(ctx, simReq)
 				if err != nil {
 					return errors.WrapSimulationFailed(err, "")
 				}
@@ -493,7 +522,7 @@ Local WASM Replay Mode:
 						Timestamp:     ts,
 					}
 					applySimulationFeeMocks(primaryReq)
-					primaryResult, primaryErr = runner.Run(primaryReq)
+					primaryResult, primaryErr = runner.Run(ctx, primaryReq)
 				}()
 
 				go func() {
@@ -533,7 +562,7 @@ Local WASM Replay Mode:
 						Timestamp:     ts,
 					}
 					applySimulationFeeMocks(compareReq)
-					compareResult, compareErr = runner.Run(compareReq)
+					compareResult, compareErr = runner.Run(ctx, compareReq)
 				}()
 
 				wg.Wait()
@@ -567,8 +596,15 @@ Local WASM Replay Mode:
 		if len(lastSimResp.Events) > 0 {
 			suggestionEngine := decoder.NewSuggestionEngine()
 
+			// Load config to get MaxTraceDepth
+			cfg, _ := config.Load()
+			maxDepth := 50
+			if cfg != nil {
+				maxDepth = cfg.MaxTraceDepth
+			}
+
 			// Decode events for analysis
-			callTree, err := decoder.DecodeEvents(lastSimResp.Events)
+			callTree, err := decoder.DecodeEvents(lastSimResp.Events, maxDepth)
 			if err == nil && callTree != nil {
 				suggestions := suggestionEngine.AnalyzeCallTree(callTree)
 				if len(suggestions) > 0 {
@@ -617,13 +653,20 @@ Local WASM Replay Mode:
 		}
 
 		// Analysis: Token Flows
+		hasTokenFlows := false
 		if report, err := tokenflow.BuildReport(resp.EnvelopeXdr, resp.ResultMetaXdr); err == nil && len(report.Agg) > 0 {
+			hasTokenFlows = true
 			fmt.Printf("\nToken Flow Summary:\n")
 			for _, line := range report.SummaryLines() {
 				fmt.Printf("  %s\n", line)
 			}
 			fmt.Printf("\nToken Flow Chart (Mermaid):\n")
 			fmt.Println(report.MermaidFlowchart())
+		}
+
+		// Persist viewer state so the next debug of this transaction restores context.
+		if uiStore != nil {
+			_ = uiStore.SaveSectionState(ctx, txHash, collectVisibleSections(lastSimResp, findings, hasTokenFlows))
 		}
 
 		// Session Management
@@ -660,6 +703,58 @@ Local WASM Replay Mode:
 		SetCurrentSession(sessionData)
 		fmt.Printf("\nSession created: %s\n", sessionData.ID)
 		fmt.Printf("Run 'erst session save' to persist this session.\n")
+
+		// Publish signed audit trail to decentralised storage when requested.
+		if publishIPFSFlag || publishArweaveFlag {
+			if auditKeyFlag == "" {
+				return errors.WrapCliArgumentRequired("audit-key")
+			}
+			auditLog, auditErr := Generate(
+				txHash,
+				resp.EnvelopeXdr,
+				resp.ResultMetaXdr,
+				lastSimResp.Events,
+				lastSimResp.Logs,
+				auditKeyFlag,
+				nil,
+			)
+			if auditErr != nil {
+				return fmt.Errorf("failed to generate audit log: %w", auditErr)
+			}
+			auditBytes, auditErr := json.Marshal(auditLog)
+			if auditErr != nil {
+				return fmt.Errorf("failed to marshal audit log: %w", auditErr)
+			}
+
+			pub := decenstorage.New(decenstorage.PublishConfig{
+				IPFSNode:       ipfsNodeFlag,
+				ArweaveGateway: arweaveGatewayFlag,
+				ArweaveWallet:  arweaveWalletFlag,
+			})
+
+			fmt.Printf("\n=== Decentralised Storage ===\n")
+
+			if publishIPFSFlag {
+				result, ipfsErr := pub.PublishIPFS(ctx, auditBytes)
+				if ipfsErr != nil {
+					fmt.Printf("IPFS publish failed: %v\n", ipfsErr)
+				} else {
+					fmt.Printf("IPFS CID : %s\n", result.CID)
+					fmt.Printf("IPFS URL : %s\n", result.URL)
+				}
+			}
+
+			if publishArweaveFlag {
+				result, arErr := pub.PublishArweave(ctx, auditBytes)
+				if arErr != nil {
+					fmt.Printf("Arweave publish failed: %v\n", arErr)
+				} else {
+					fmt.Printf("Arweave TXID : %s\n", result.TXID)
+					fmt.Printf("Arweave URL  : %s\n", result.URL)
+				}
+			}
+		}
+
 		return nil
 	},
 }
@@ -691,50 +786,53 @@ func runDemoMode(cmdArgs []string) error {
 func runLocalWasmReplay() error {
 	fmt.Printf("%s  WARNING: Using Mock State (not mainnet data)\n", visualizer.Warning())
 	fmt.Println()
-	effectiveWasmPath := wasmPath
 
 	// Verify WASM file exists
-	if _, err := os.Stat(effectiveWasmPath); os.IsNotExist(err) {
+	if _, err := os.Stat(wasmPath); os.IsNotExist(err) {
 		return errors.WrapValidationError(fmt.Sprintf("WASM file not found: %s", wasmPath))
 	}
 
-	optimizedPath, report, cleanup, err := optimizeWasmFileIfRequested(effectiveWasmPath, wasmOptimizeFlag)
-	if err != nil {
-		return errors.WrapValidationError(fmt.Sprintf("failed to optimize WASM: %v", err))
-	}
-	defer cleanup()
-	effectiveWasmPath = optimizedPath
-
 	fmt.Printf("%s Local WASM Replay Mode\n", visualizer.Symbol("wrench"))
-	fmt.Printf("WASM File: %s\n", effectiveWasmPath)
-	if wasmOptimizeFlag {
-		printOptimizationReport(report)
-	}
+	fmt.Printf("WASM File: %s\n", wasmPath)
 	fmt.Printf("Arguments: %v\n", args)
 	fmt.Println()
 
 	// Check for LTO in the project that produced the WASM
-	checkLTOWarning(effectiveWasmPath)
+	checkLTOWarning(wasmPath)
 
 	// Create simulator runner
 	runner, err := simulator.NewRunner("", tracingEnabled)
 	if err != nil {
 		return errors.WrapSimulatorNotFound(err.Error())
 	}
+	defer runner.Close()
 
-	// Create simulation request with local WASM
+	ctx := context.Background()
+	if hotReloadFlag {
+		return runLocalWasmReplaySession(ctx, runner, os.Stdin, os.Stdout)
+	}
+	return runLocalWasmReplayOnce(ctx, runner, false)
+}
+
+func newLocalWasmSimulationRequest(forceNoCache bool) *simulator.SimulationRequest {
 	req := &simulator.SimulationRequest{
 		EnvelopeXdr:   "",  // Empty for local replay
 		ResultMetaXdr: "",  // Empty for local replay
 		LedgerEntries: nil, // Mock state will be generated
-		WasmPath:      &effectiveWasmPath,
+		WasmPath:      &wasmPath,
+		NoCache:       noCacheFlag || forceNoCache,
 		MockArgs:      &args,
 	}
 	applySimulationFeeMocks(req)
+	return req
+}
+
+func runLocalWasmReplayOnce(ctx context.Context, runner simulator.RunnerInterface, forceNoCache bool) error {
+	req := newLocalWasmSimulationRequest(forceNoCache)
 
 	// Run simulation
 	fmt.Printf("%s Executing contract locally...\n", visualizer.Symbol("play"))
-	resp, err := runner.Run(req)
+	resp, err := runner.Run(ctx, req)
 	if err != nil {
 		fmt.Printf("%s Technical failure: %v\n", visualizer.Error(), err)
 		return err
@@ -751,7 +849,7 @@ func runLocalWasmReplay() error {
 		// Fallback to WAT disassembly if source mapping is unavailable but we have an offset
 		if resp.SourceLocation == "" && resp.WasmOffset != nil {
 			fmt.Println()
-			wasmBytes, err := os.ReadFile(effectiveWasmPath)
+			wasmBytes, err := os.ReadFile(wasmPath)
 			if err == nil {
 				fallbackMsg := wat.FormatFallback(wasmBytes, *resp.WasmOffset, 5)
 				fmt.Println(fallbackMsg)
@@ -789,6 +887,117 @@ func runLocalWasmReplay() error {
 	}
 
 	return nil
+}
+
+func runLocalWasmReplaySession(ctx context.Context, runner simulator.RunnerInterface, in io.Reader, out io.Writer) error {
+	fmt.Println("[watcher] Hot reload enabled")
+	if err := runLocalWasmReplayOnce(ctx, runner, false); err != nil {
+		return err
+	}
+
+	initialFP, err := watch.ComputeWasmFingerprint(wasmPath, 5, 50*time.Millisecond)
+	if err != nil {
+		return errors.WrapValidationError(fmt.Sprintf("failed to fingerprint initial wasm: %v", err))
+	}
+	lastAppliedHash := initialFP.Hash
+
+	cfg := watch.DefaultWasmReloaderConfig(wasmPath, hotReloadInterval)
+	reloadEvents, reloadErrors, err := watch.StartWasmReloader(ctx, cfg)
+	if err != nil {
+		return errors.WrapValidationError(fmt.Sprintf("failed to start wasm watcher: %v", err))
+	}
+	fmt.Println("[watcher] Watching for WASM changes")
+
+	reader := bufio.NewReader(in)
+	var pending *watch.ReloadEvent
+
+	for {
+		if pending != nil {
+			choice, promptErr := promptHotReloadChoice(reader, out)
+			if promptErr != nil {
+				return promptErr
+			}
+
+			switch choice {
+			case 'r':
+				fmt.Println("[watcher] Re-running simulation with updated WASM")
+				if err := runLocalWasmReplayOnce(ctx, runner, true); err != nil {
+					fmt.Printf("[watcher] Re-run failed: %v\n", err)
+				} else {
+					lastAppliedHash = pending.Hash
+				}
+			case 's':
+				fmt.Println("[watcher] Reload skipped")
+			case 'q':
+				fmt.Println("[watcher] Exiting hot reload session")
+				return nil
+			}
+			pending = drainLatestReloadEvent(reloadEvents, lastAppliedHash)
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case watchErr, ok := <-reloadErrors:
+			if !ok {
+				reloadErrors = nil
+				continue
+			}
+			fmt.Printf("[watcher] Warning: %v\n", watchErr)
+		case event, ok := <-reloadEvents:
+			if !ok {
+				return nil
+			}
+			if event.Hash == lastAppliedHash {
+				continue
+			}
+			fmt.Println("[watcher] WASM updated (hash changed)")
+			fmt.Println("[watcher] Reload available")
+			pending = &event
+		}
+	}
+}
+
+func promptHotReloadChoice(reader *bufio.Reader, out io.Writer) (byte, error) {
+	for {
+		fmt.Fprint(out, "Re-run simulation? (r = reload, s = skip, q = quit): ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF && strings.TrimSpace(line) != "" {
+				// Accept final line without trailing newline.
+			} else {
+				return 0, err
+			}
+		}
+
+		choice := strings.ToLower(strings.TrimSpace(line))
+		switch choice {
+		case "r", "s", "q":
+			return choice[0], nil
+		default:
+			fmt.Fprintln(out, "Invalid choice. Please enter r, s, or q.")
+		}
+	}
+}
+
+func drainLatestReloadEvent(events <-chan watch.ReloadEvent, lastAppliedHash string) *watch.ReloadEvent {
+	var latest *watch.ReloadEvent
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return latest
+			}
+			if event.Hash == lastAppliedHash {
+				continue
+			}
+			ev := event
+			latest = &ev
+		default:
+			return latest
+		}
+	}
 }
 
 func extractLedgerKeys(metaXdr string) ([]string, error) {
@@ -1035,6 +1244,28 @@ func diffResults(res1, res2 *simulator.SimulationResponse, net1, net2 string) {
 	}
 }
 
+// collectVisibleSections returns the names of output sections that contained
+// data during the last simulation run.
+func collectVisibleSections(resp *simulator.SimulationResponse, findings []security.Finding, hasTokenFlows bool) []string {
+	var sections []string
+	if resp.BudgetUsage != nil {
+		sections = append(sections, "budget")
+	}
+	if len(resp.DiagnosticEvents) > 0 {
+		sections = append(sections, "events")
+	}
+	if len(resp.Logs) > 0 {
+		sections = append(sections, "logs")
+	}
+	if len(findings) > 0 {
+		sections = append(sections, "security")
+	}
+	if hasTokenFlows {
+		sections = append(sections, "tokenflow")
+	}
+	return sections
+}
+
 func applySimulationFeeMocks(req *simulator.SimulationRequest) {
 	if req == nil {
 		return
@@ -1091,14 +1322,18 @@ func init() {
 	debugCmd.Flags().StringVar(&compareNetworkFlag, "compare-network", "", "Network to compare against (testnet, mainnet, futurenet)")
 	debugCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 	debugCmd.Flags().StringVar(&wasmPath, "wasm", "", "Path to local WASM file for local replay (no network required)")
-	debugCmd.Flags().BoolVar(&wasmOptimizeFlag, "optimize", false, "Run dead-code elimination on local WASM before replay")
 	debugCmd.Flags().StringSliceVar(&args, "args", []string{}, "Mock arguments for local replay (JSON array of strings)")
 	debugCmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable local ledger state caching")
 	debugCmd.Flags().BoolVar(&demoMode, "demo", false, "Print sample output (no network) - for testing color detection")
 	debugCmd.Flags().BoolVar(&watchFlag, "watch", false, "Poll for transaction on-chain before debugging")
 	debugCmd.Flags().IntVar(&watchTimeoutFlag, "watch-timeout", 30, "Timeout in seconds for watch mode")
+	debugCmd.Flags().BoolVar(&hotReloadFlag, "hot-reload", false, "Hot reload local WASM changes during debug session (requires --wasm)")
+	debugCmd.Flags().DurationVar(&hotReloadInterval, "hot-reload-interval", 500*time.Millisecond, "Polling interval fallback for hot reload (e.g. 500ms)")
 	debugCmd.Flags().Uint32Var(&mockBaseFeeFlag, "mock-base-fee", 0, "Override base fee (stroops) for local fee sufficiency checks")
 	debugCmd.Flags().Uint64Var(&mockGasPriceFlag, "mock-gas-price", 0, "Override gas price multiplier for local fee sufficiency checks")
+	debugCmd.Flags().StringVar(&themeFlag, "theme", "", "Color theme override (dark, light, none)")
+	debugCmd.Flags().Int64Var(&mockTimeFlag, "mock-time", 0, "Override ledger timestamp for simulation (Unix seconds)")
+	debugCmd.Flags().Uint32Var(&protocolVersionFlag, "protocol-version", 0, "Override protocol version for simulation")
 
 	rootCmd.AddCommand(debugCmd)
 }
@@ -1128,7 +1363,6 @@ func checkLTOWarning(wasmFilePath string) {
 		dir = parent
 	}
 }
-
 func displaySourceLocation(loc *simulator.SourceLocation) {
 	fmt.Printf("%s Location: %s:%d:%d\n", visualizer.Symbol("location"), loc.File, loc.Line, loc.Column)
 

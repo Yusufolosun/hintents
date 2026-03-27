@@ -1,4 +1,4 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package cmd
@@ -109,6 +109,8 @@ func init() {
 	daemonCmd.Flags().StringVar(&daemonAuthToken, "auth-token", "", "Authentication token for API access")
 	daemonCmd.Flags().BoolVar(&daemonTracing, "tracing", false, "Enable OpenTelemetry tracing")
 	daemonCmd.Flags().StringVar(&daemonOTLPURL, "otlp-url", "http://localhost:4318", "OTLP exporter URL")
+
+	_ = daemonCmd.RegisterFlagCompletionFunc("network", completeNetworkFlag)
 
 	rootCmd.AddCommand(daemonCmd)
 }

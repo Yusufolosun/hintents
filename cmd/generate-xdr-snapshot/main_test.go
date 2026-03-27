@@ -1,4 +1,4 @@
-// Copyright 2025 Erst Users
+// Copyright 2026 Erst Users
 // SPDX-License-Identifier: Apache-2.0
 
 package main
@@ -216,12 +216,10 @@ func TestValueVariety(t *testing.T) {
 	gen := NewEntryGenerator(config)
 
 	// Generate multiple values and verify they're different
-	values := make([]string, 0, 100)
 	hashes := make(map[string]int)
 
 	for i := 0; i < 100; i++ {
 		value := gen.GenerateRandomValue()
-		values = append(values, value)
 
 		// Compute hash of the value for quick dedup check
 		h := sha256.Sum256([]byte(value))
@@ -321,7 +319,7 @@ func BenchmarkValueGeneration(b *testing.B) {
 // BenchmarkEntryGeneration benchmarks complete entry generation
 func BenchmarkEntryGeneration(b *testing.B) {
 	config := &GeneratorConfig{
-		Count:      b.N,
+		Count:      int64(b.N),
 		OutputFile: "bench_entries.json",
 		Verbose:    false,
 	}
