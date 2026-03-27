@@ -11,6 +11,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 )
 
 // ---- helpers ----------------------------------------------------------------
@@ -555,4 +556,270 @@ func TestScValToGoValue_UnsupportedType(t *testing.T) {
 	_, err := ScValToGoValue(v)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported ScVal type")
+}
+
+// ============================================================================
+// Property-Based Tests (pgregory.net/rapid)
+// ============================================================================
+
+// Feature: scval-type-conversion, Property 1: Integer primitive identity
+// For any uint32, int32, uint64, or int64 value v, wrapping it in the
+// corresponding ScVal type and passing it through ScValToGoValue should return
+// a value equal to v.
+// Validates: Requirements 1.3, 1.4, 1.5, 1.6
+func TestProp_IntegerPrimitiveIdentity(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		// u32
+		u32val := rapid.Uint32().Draw(rt, "u32")
+		v := xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: u32Ptr(u32val)}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, u32val, got.(uint32))
+
+		// i32
+		i32val := rapid.Int32().Draw(rt, "i32")
+		v = xdr.ScVal{Type: xdr.ScValTypeScvI32, I32: i32Ptr(i32val)}
+		got, err = ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, i32val, got.(int32))
+
+		// u64
+		u64val := rapid.Uint64().Draw(rt, "u64")
+		v = xdr.ScVal{Type: xdr.ScValTypeScvU64, U64: u64Ptr(u64val)}
+		got, err = ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, u64val, got.(uint64))
+
+		// i64
+		i64val := rapid.Int64().Draw(rt, "i64")
+		v = xdr.ScVal{Type: xdr.ScValTypeScvI64, I64: i64Ptr(i64val)}
+		got, err = ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, i64val, got.(int64))
+	})
+}
+
+// Feature: scval-type-conversion, Property 2: u128 round-trip
+// For any pair of uint64 values (hi, lo), constructing a UInt128Parts ScVal
+// and converting it should return a *big.Int equal to hi*2^64 + lo.
+// Validates: Requirements 2.1, 2.2
+func TestProp_U128RoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		hi := rapid.Uint64().Draw(rt, "hi")
+		lo := rapid.Uint64().Draw(rt, "lo")
+		v := xdr.ScVal{
+			Type: xdr.ScValTypeScvU128,
+			U128: &xdr.UInt128Parts{Hi: xdr.Uint64(hi), Lo: xdr.Uint64(lo)},
+		}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+
+		expected := new(big.Int).SetUint64(hi)
+		expected.Lsh(expected, 64)
+		expected.Or(expected, new(big.Int).SetUint64(lo))
+		assert.Equal(rt, 0, got.(*big.Int).Cmp(expected))
+	})
+}
+
+// Feature: scval-type-conversion, Property 3: i128 round-trip
+// For any (hi int64, lo uint64), constructing an Int128Parts ScVal and
+// converting it should return a *big.Int equal to int64(hi)*2^64 + uint64(lo).
+// Validates: Requirements 2.3, 2.4
+func TestProp_I128RoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		hi := rapid.Int64().Draw(rt, "hi")
+		lo := rapid.Uint64().Draw(rt, "lo")
+		v := xdr.ScVal{
+			Type: xdr.ScValTypeScvI128,
+			I128: &xdr.Int128Parts{Hi: xdr.Int64(hi), Lo: xdr.Uint64(lo)},
+		}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+
+		expected := new(big.Int).SetInt64(hi)
+		expected.Lsh(expected, 64)
+		expected.Add(expected, new(big.Int).SetUint64(lo))
+		assert.Equal(rt, 0, got.(*big.Int).Cmp(expected))
+	})
+}
+
+// Feature: scval-type-conversion, Property 4: u256 round-trip
+// For any four uint64 limbs, constructing a UInt256Parts ScVal and converting
+// it should return a *big.Int equal to hhh*2^192 + hhl*2^128 + lhh*2^64 + lll.
+// Validates: Requirements 2.5, 2.6
+func TestProp_U256RoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		hhh := rapid.Uint64().Draw(rt, "hhh")
+		hhl := rapid.Uint64().Draw(rt, "hhl")
+		lhh := rapid.Uint64().Draw(rt, "lhh")
+		lll := rapid.Uint64().Draw(rt, "lll")
+		v := xdr.ScVal{
+			Type: xdr.ScValTypeScvU256,
+			U256: &xdr.UInt256Parts{
+				HiHi: xdr.Uint64(hhh),
+				HiLo: xdr.Uint64(hhl),
+				LoHi: xdr.Uint64(lhh),
+				LoLo: xdr.Uint64(lll),
+			},
+		}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+
+		tmp := new(big.Int)
+		expected := new(big.Int).SetUint64(hhh)
+		expected.Lsh(expected, 64).Or(expected, tmp.SetUint64(hhl))
+		expected.Lsh(expected, 64).Or(expected, tmp.SetUint64(lhh))
+		expected.Lsh(expected, 64).Or(expected, tmp.SetUint64(lll))
+		assert.Equal(rt, 0, got.(*big.Int).Cmp(expected))
+	})
+}
+
+// Feature: scval-type-conversion, Property 5: i256 round-trip
+// For any (hhh int64, hhl/lhh/lll uint64), constructing an Int256Parts ScVal
+// and converting it should return the correct signed *big.Int.
+// Validates: Requirements 2.7
+func TestProp_I256RoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		hhh := rapid.Int64().Draw(rt, "hhh")
+		hhl := rapid.Uint64().Draw(rt, "hhl")
+		lhh := rapid.Uint64().Draw(rt, "lhh")
+		lll := rapid.Uint64().Draw(rt, "lll")
+		v := xdr.ScVal{
+			Type: xdr.ScValTypeScvI256,
+			I256: &xdr.Int256Parts{
+				HiHi: xdr.Int64(hhh),
+				HiLo: xdr.Uint64(hhl),
+				LoHi: xdr.Uint64(lhh),
+				LoLo: xdr.Uint64(lll),
+			},
+		}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+
+		tmp := new(big.Int)
+		expected := new(big.Int).SetInt64(hhh)
+		expected.Lsh(expected, 64).Or(expected, tmp.SetUint64(hhl))
+		expected.Lsh(expected, 64).Or(expected, tmp.SetUint64(lhh))
+		expected.Lsh(expected, 64).Add(expected, tmp.SetUint64(lll))
+		assert.Equal(rt, 0, got.(*big.Int).Cmp(expected))
+	})
+}
+
+// Feature: scval-type-conversion, Property 6: Bytes round-trip
+// For any []byte slice b, constructing an ScvBytes ScVal and converting it
+// should return a []byte that is byte-for-byte equal to b.
+// Validates: Requirements 3.1, 3.4
+func TestProp_BytesRoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		data := rapid.SliceOf(rapid.Byte()).Draw(rt, "data")
+		v := xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: bytesPtr(data)}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, data, got.([]byte))
+	})
+}
+
+// Feature: scval-type-conversion, Property 7: String and Symbol round-trip
+// For any string s, constructing both ScvString and ScvSymbol ScVals from s
+// and converting each should return a string equal to s.
+// Validates: Requirements 3.2, 3.3
+func TestProp_StringSymbolRoundTrip(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		s := rapid.String().Draw(rt, "s")
+
+		vs := xdr.ScVal{Type: xdr.ScValTypeScvString, Str: strPtr(s)}
+		gotS, err := ScValToGoValue(vs)
+		require.NoError(rt, err)
+		assert.Equal(rt, s, gotS.(string))
+
+		vsym := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: symPtr(s)}
+		gotSym, err := ScValToGoValue(vsym)
+		require.NoError(rt, err)
+		assert.Equal(rt, s, gotSym.(string))
+	})
+}
+
+// Feature: scval-type-conversion, Property 8: Vec element conversion
+// For any slice of primitive ScVal elements, converting the enclosing ScvVec
+// should return a []interface{} of the same length where each element equals
+// the individually converted ScVal.
+// Validates: Requirements 4.1, 4.2
+func TestProp_VecElementConversion(t *testing.T) {
+	// Generator for a single primitive ScVal (u32 only, to keep it simple)
+	primGen := rapid.Custom(func(rt *rapid.T) xdr.ScVal {
+		n := rapid.Uint32().Draw(rt, "elem")
+		return xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: u32Ptr(n)}
+	})
+
+	rapid.Check(t, func(rt *rapid.T) {
+		elems := rapid.SliceOf(primGen).Draw(rt, "elems")
+		sv := xdr.ScVec(elems)
+		svp := &sv
+		v := xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &svp}
+
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+		result := got.([]interface{})
+		require.Len(rt, result, len(elems))
+
+		for i, elem := range elems {
+			expected, err2 := ScValToGoValue(elem)
+			require.NoError(rt, err2)
+			assert.Equal(rt, expected, result[i])
+		}
+	})
+}
+
+// Feature: scval-type-conversion, Property 9: Map round-trip (entries and order)
+// For any slice of ScMapEntry values, converting the enclosing ScvMap should
+// return a []ScValMapEntry of the same length where each entry's Key and Value
+// equal the individually converted ScVal values, and the order is preserved.
+// Validates: Requirements 5.1, 5.2, 5.3
+func TestProp_MapRoundTrip(t *testing.T) {
+	entryGen := rapid.Custom(func(rt *rapid.T) xdr.ScMapEntry {
+		k := rapid.Uint32().Draw(rt, "key")
+		val := rapid.Uint32().Draw(rt, "val")
+		return xdr.ScMapEntry{
+			Key: xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: u32Ptr(k)},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: u32Ptr(val)},
+		}
+	})
+
+	rapid.Check(t, func(rt *rapid.T) {
+		entries := rapid.SliceOf(entryGen).Draw(rt, "entries")
+		sm := xdr.ScMap(entries)
+		smp := &sm
+		v := xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &smp}
+
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+		result := got.([]ScValMapEntry)
+		require.Len(rt, result, len(entries))
+
+		for i, entry := range entries {
+			expectedKey, err2 := ScValToGoValue(entry.Key)
+			require.NoError(rt, err2)
+			expectedVal, err3 := ScValToGoValue(entry.Val)
+			require.NoError(rt, err3)
+			assert.Equal(rt, expectedKey, result[i].Key)
+			assert.Equal(rt, expectedVal, result[i].Value)
+		}
+	})
+}
+
+// Feature: scval-type-conversion, Property 10: Nonce identity
+// For any int64 nonce value n, constructing an ScvLedgerKeyNonce ScVal and
+// converting it should return an int64 equal to n.
+// Validates: Requirements 6.3
+func TestProp_NonceIdentity(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		n := rapid.Int64().Draw(rt, "nonce")
+		v := xdr.ScVal{
+			Type:     xdr.ScValTypeScvLedgerKeyNonce,
+			NonceKey: &xdr.ScNonceKey{Nonce: xdr.Int64(n)},
+		}
+		got, err := ScValToGoValue(v)
+		require.NoError(rt, err)
+		assert.Equal(rt, n, got.(int64))
+	})
 }
