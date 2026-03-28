@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 /// Identifies the kind of streaming frame emitted to stdout.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameType {
@@ -22,6 +23,7 @@ pub enum FrameType {
 /// The Go bridge reads these lines from the simulator subprocess stdout pipe
 /// in a background goroutine, enabling the UI to populate frames before the
 /// simulation finishes (reducing Time-to-First-Interactive).
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamFrame {
     /// Discriminates snapshot frames from the terminal final frame.
@@ -42,6 +44,7 @@ impl StreamFrame {
     /// from concurrent contexts. Write errors are logged to stderr and ignored
     /// so that simulation output is not disrupted by a broken pipe — the Go
     /// side will detect the closed reader and surface the error via `Wait()`.
+    #[allow(dead_code)]
     pub fn emit(&self) {
         match serde_json::to_string(self) {
             Ok(line) => {
@@ -61,6 +64,7 @@ impl StreamFrame {
 /// # Arguments
 /// * `seq`  – Monotonically increasing sequence number for this run (start at 0).
 /// * `data` – Ledger snapshot data to forward to the Go bridge.
+#[allow(dead_code)]
 pub fn emit_snapshot_frame(seq: u32, data: serde_json::Value) {
     StreamFrame {
         frame_type: FrameType::Snapshot,
@@ -76,6 +80,7 @@ pub fn emit_snapshot_frame(seq: u32, data: serde_json::Value) {
 /// # Arguments
 /// * `seq`  – Sequence number immediately following the last snapshot frame.
 /// * `data` – The complete `SimulationResponse` as a `serde_json::Value`.
+#[allow(dead_code)]
 pub fn emit_final_frame(seq: u32, data: serde_json::Value) {
     StreamFrame {
         frame_type: FrameType::Final,
